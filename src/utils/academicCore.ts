@@ -4,7 +4,7 @@ import {
   normalizeAcademicQuery,
 } from './programDetection.ts';
 
-export const GEMINI_MODEL = 'gemini-4-hydrogen';
+export const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
 export interface ProgramContext {
   id?: string;
