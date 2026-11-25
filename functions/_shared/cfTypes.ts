@@ -119,6 +119,12 @@ export class GeminiUpstreamError extends Error {
   }
 }
 
+function computeRetryDelayMs(attempt: number): number {
+  const baseDelayMs = 900 * Math.pow(2, attempt - 1); // attempt 1: 900ms, attempt 2: 1800ms
+  const jitterMs = Math.floor(Math.random() * 250);
+  return baseDelayMs + jitterMs;
+}
+
 export async function callGeminiRest(
   apiKey: string,
   model: string,
@@ -128,12 +134,21 @@ export async function callGeminiRest(
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent`;
-  const timeoutMs = options.timeoutMs ?? 20000;
+  const maxAttempts = 3;
+  const perAttemptTimeoutMs = options.timeoutMs ?? 20000;
+  const totalBudgetMs = Math.min(Math.max(perAttemptTimeoutMs + 5000, perAttemptTimeoutMs), 25000);
+  const deadlineAt = Date.now() + totalBudgetMs;
 
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const remainingBudgetMs = deadlineAt - Date.now();
+    if (remainingBudgetMs <= 0) {
+      break;
+    }
+
+    const attemptTimeoutMs = Math.min(perAttemptTimeoutMs, remainingBudgetMs);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
 
     try {
       const res = await fetch(endpoint, {
@@ -209,11 +224,14 @@ export async function callGeminiRest(
           controller.signal.aborted ||
           (err instanceof Error && err.name === 'AbortError');
         if (isAbort) {
-          wrapped = new GeminiUpstreamError(`Gemini API request timed out after ${timeoutMs}ms`, {
-            status: 504,
-            isTimeout: true,
-            diagnosticMessage: `Request timeout (${timeoutMs}ms)`,
-          });
+          wrapped = new GeminiUpstreamError(
+            `Gemini API request timed out after ${attemptTimeoutMs}ms`,
+            {
+              status: 504,
+              isTimeout: true,
+              diagnosticMessage: `Request timeout (${attemptTimeoutMs}ms)`,
+            }
+          );
         } else {
           const detail = sanitizeDiagnosticDetail(
             err instanceof Error ? err.message : String(err || 'Network fetch failed'),
@@ -227,16 +245,25 @@ export async function callGeminiRest(
       }
 
       lastError = wrapped;
-      const shouldRetry =
-        attempt < 2 &&
-        (wrapped.status === 500 ||
-          wrapped.status === 503 ||
-          wrapped.isTimeout === true ||
-          wrapped.isNetworkError === true);
+      const grpcUpper = (wrapped.grpcStatus || '').toUpperCase();
+      const isTransientStatus =
+        wrapped.status === 500 ||
+        wrapped.status === 503 ||
+        wrapped.upstreamHttpStatus === 500 ||
+        wrapped.upstreamHttpStatus === 503 ||
+        grpcUpper === 'INTERNAL' ||
+        grpcUpper === 'UNAVAILABLE';
+      const isRetryable =
+        isTransientStatus || wrapped.isTimeout === true || wrapped.isNetworkError === true;
 
-      if (shouldRetry) {
-        await new Promise((r) => setTimeout(r, 600));
-        continue;
+      if (attempt < maxAttempts && isRetryable) {
+        const delayMs = computeRetryDelayMs(attempt);
+        const remainingAfterFailure = deadlineAt - Date.now();
+        const minHeadroomMs = wrapped.isTimeout ? 2500 : 1000;
+        if (remainingAfterFailure > delayMs + minHeadroomMs) {
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
       }
       throw wrapped;
     } finally {
