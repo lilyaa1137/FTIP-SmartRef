@@ -12,6 +12,15 @@ export type CfPagesHandler<Env = CfPagesEnv> = (
   context: CfPagesContext<Env>
 ) => Promise<Response> | Response;
 
+export function resolveApiKey(env: CfPagesEnv | undefined): string | null {
+  const raw = typeof env?.GEMINI_API_KEY === 'string' ? env.GEMINI_API_KEY : '';
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '').trim();
+  if (!cleaned || cleaned === 'MY_GEMINI_API_KEY') {
+    return null;
+  }
+  return cleaned;
+}
+
 export function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,

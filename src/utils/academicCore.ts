@@ -33,6 +33,20 @@ export function sanitizeText(value: unknown, maxLength: number): string {
   return value.trim().slice(0, maxLength);
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function sanitizeSafeHttpUrl(urlValue: unknown): string | null {
   if (typeof urlValue !== 'string' || !urlValue.trim()) return null;
   try {
@@ -207,13 +221,16 @@ export async function searchOpenAlexWorks(
     }
 
     const url = `https://api.openalex.org/works?${params.toString()}`;
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'FTIP-SmartRef-Unpad/1.0 (mailto:library.ftip@unpad.ac.id)',
+    const res = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'FTIP-SmartRef-Unpad/1.0 (mailto:library.ftip@unpad.ac.id)',
+        },
       },
-    });
+      timeoutMs
+    );
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (!res.ok || !ct.includes('application/json')) {
       throw new Error(`OpenAlex HTTP ${res.status}`);
@@ -270,13 +287,16 @@ export async function searchCrossrefWorks(
   }
 
   const url = `https://api.crossref.org/works?${params.toString()}`;
-  const res = await fetch(url, {
-    signal: AbortSignal.timeout(timeoutMs),
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'FTIP-SmartRef-Unpad/1.0 (mailto:library.ftip@unpad.ac.id)',
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'FTIP-SmartRef-Unpad/1.0 (mailto:library.ftip@unpad.ac.id)',
+      },
     },
-  });
+    timeoutMs
+  );
   const ct = (res.headers.get('content-type') || '').toLowerCase();
   if (!res.ok || !ct.includes('application/json')) {
     throw new Error(`Crossref HTTP ${res.status}`);

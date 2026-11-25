@@ -5,7 +5,7 @@ import {
   sanitizeText,
 } from '../../src/utils/academicCore.ts';
 import type { ProgramContext } from '../../src/utils/academicCore.ts';
-import { callGeminiRest, jsonResponse, readJsonBody } from '../_shared/cfTypes.ts';
+import { callGeminiRest, jsonResponse, readJsonBody, resolveApiKey } from '../_shared/cfTypes.ts';
 import type { CfPagesHandler } from '../_shared/cfTypes.ts';
 
 export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
@@ -29,13 +29,13 @@ export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
       );
     }
 
-    const apiKey = env.GEMINI_API_KEY?.trim();
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    const apiKey = resolveApiKey(env);
+    if (!apiKey) {
       return jsonResponse(
         {
           errorCode: 'MISSING_GEMINI_API_KEY',
           error:
-            'Smart Keyword Generator AI belum aktif karena GEMINI_API_KEY belum dikonfigurasi pada server Cloudflare Pages. Tambahkan GEMINI_API_KEY di Environment Variables (Secrets).',
+            'Smart Keyword Generator AI belum aktif karena GEMINI_API_KEY belum dikonfigurasi pada environment Cloudflare Pages (Production/Preview). Tambahkan GEMINI_API_KEY di Cloudflare Pages > Settings > Environment variables lalu lakukan redeploy.',
         },
         503
       );
