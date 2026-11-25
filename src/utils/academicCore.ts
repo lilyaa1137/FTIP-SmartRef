@@ -445,55 +445,197 @@ Instruksi:
 - Berikan daftar kueri pencarian Bahasa Inggris yang ringkas dan bersih (tanpa kata sambung Indonesia) untuk langsung dijalankan di OpenAlex, Crossref, ScienceDirect, Scopus, dan Portal Garuda, disertai catatan strategi singkat dalam Bahasa Indonesia.`;
 }
 
+export interface GeminiErrorDiagnostic {
+  upstreamStatus?: number;
+  upstreamCode?: number;
+  upstreamGrpcStatus?: string;
+  upstreamReason?: string;
+  detail?: string;
+}
+
+export function sanitizeDiagnosticDetail(value: unknown, maxLength = 180): string {
+  const raw = typeof value === 'string' ? value : value instanceof Error ? value.message : String(value ?? '');
+  if (!raw) return '';
+  return raw
+    .replace(/AIza[0-9A-Za-z_-]{8,}/g, '[REDACTED_KEY]')
+    .replace(/\b(api[_-]?key|x-goog-api-key|authorization|bearer)\b\s*[:=]\s*\S+/gi, '$1=[REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function formatDiagnosticSuffix(errorCode: string, diagnostic: GeminiErrorDiagnostic): string {
+  const metaParts: string[] = [errorCode];
+  if (typeof diagnostic.upstreamStatus === 'number') {
+    metaParts.push(`HTTP ${diagnostic.upstreamStatus}`);
+  }
+  if (diagnostic.upstreamReason) {
+    metaParts.push(diagnostic.upstreamReason);
+  } else if (diagnostic.upstreamGrpcStatus) {
+    metaParts.push(diagnostic.upstreamGrpcStatus);
+  }
+  const meta = metaParts.join(' · ');
+  return diagnostic.detail ? `[${meta}: ${diagnostic.detail}]` : `[${meta}]`;
+}
+
 export function classifyGeminiError(err: unknown): {
   httpStatus: number;
   errorCode: string;
   message: string;
+  diagnostic: GeminiErrorDiagnostic;
 } {
   const rawMessage = err instanceof Error ? err.message : String(err || '');
   const upper = rawMessage.toUpperCase();
-  const statusProp =
-    typeof err === 'object' && err !== null && 'status' in err
-      ? Number((err as { status?: unknown }).status)
-      : NaN;
+  const obj = (typeof err === 'object' && err !== null ? err : {}) as Record<string, unknown>;
+
+  const statusNum = Number(obj.status);
+  const statusProp = Number.isFinite(statusNum) && statusNum > 0 ? statusNum : NaN;
+  const upstreamHttpNum = Number(obj.upstreamHttpStatus);
+  const upstreamHttpStatus =
+    Number.isFinite(upstreamHttpNum) && upstreamHttpNum > 0
+      ? upstreamHttpNum
+      : Number.isFinite(statusProp)
+        ? statusProp
+        : undefined;
+  const upstreamCodeNum = Number(obj.upstreamCode);
+  const upstreamCode =
+    Number.isFinite(upstreamCodeNum) && upstreamCodeNum > 0 ? upstreamCodeNum : undefined;
+  const upstreamGrpcStatus =
+    typeof obj.grpcStatus === 'string' && obj.grpcStatus.trim() ? obj.grpcStatus.trim() : undefined;
+  const upstreamReason =
+    typeof obj.reason === 'string' && obj.reason.trim() ? obj.reason.trim() : undefined;
+
+  const isTimeout =
+    obj.isTimeout === true ||
+    (err instanceof Error && err.name === 'AbortError') ||
+    upper.includes('TIMEOUT') ||
+    upper.includes('TIMED OUT') ||
+    upper.includes('ABORTED');
+  const isNetworkError = obj.isNetworkError === true;
+
+  const detail = sanitizeDiagnosticDetail(
+    typeof obj.diagnosticMessage === 'string' && obj.diagnosticMessage.trim()
+      ? obj.diagnosticMessage
+      : rawMessage,
+    180
+  );
+
+  const diagnostic: GeminiErrorDiagnostic = {
+    ...(upstreamHttpStatus !== undefined ? { upstreamStatus: upstreamHttpStatus } : {}),
+    ...(upstreamCode !== undefined ? { upstreamCode } : {}),
+    ...(upstreamGrpcStatus ? { upstreamGrpcStatus } : {}),
+    ...(upstreamReason ? { upstreamReason } : {}),
+    ...(detail ? { detail } : {}),
+  };
+
+  const grpcUpper = (upstreamGrpcStatus || '').toUpperCase();
+  const reasonUpper = (upstreamReason || '').toUpperCase();
+
+  if (isTimeout || statusProp === 504) {
+    const errorCode = 'GEMINI_TIMEOUT';
+    return {
+      httpStatus: 504,
+      errorCode,
+      message: `Permintaan ke Gemini AI melebihi batas waktu (timeout). Silakan coba kembali beberapa saat lagi. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
 
   if (
-    statusProp === 403 ||
-    upper.includes('PERMISSION_DENIED') ||
-    upper.includes('API_KEY_INVALID') ||
-    (statusProp === 400 && upper.includes('API KEY'))
+    statusProp === 429 ||
+    grpcUpper === 'RESOURCE_EXHAUSTED' ||
+    upper.includes('RESOURCE_EXHAUSTED') ||
+    upper.includes('QUOTA')
   ) {
-    return {
-      httpStatus: statusProp === 400 ? 400 : 403,
-      errorCode: 'INVALID_GEMINI_API_KEY',
-      message:
-        'Kunci GEMINI_API_KEY tidak valid atau tidak memiliki izin akses. Silakan periksa kembali API key Anda di panel Settings > Secrets atau konfigurasi environment server.',
-    };
-  }
-
-  if (statusProp === 429 || upper.includes('RESOURCE_EXHAUSTED') || upper.includes('QUOTA')) {
+    const errorCode = 'GEMINI_RATE_LIMIT';
     return {
       httpStatus: 429,
-      errorCode: 'GEMINI_RATE_LIMIT',
-      message:
-        'Batas kuota permintaan Gemini API sedang tercapai. Silakan tunggu beberapa saat sebelum mencoba lagi, atau periksa kuota API key Anda.',
+      errorCode,
+      message: `Batas kuota permintaan Gemini API sedang tercapai. Silakan tunggu beberapa saat sebelum mencoba lagi, atau periksa kuota API key Anda. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
     };
   }
 
-  if (statusProp === 404 || upper.includes('NOT_FOUND')) {
+  if (statusProp === 401 || grpcUpper === 'UNAUTHENTICATED' || upper.includes('UNAUTHENTICATED')) {
+    const errorCode = 'GEMINI_UNAUTHENTICATED';
+    return {
+      httpStatus: 401,
+      errorCode,
+      message: `Autentikasi Gemini API gagal (HTTP 401). Silakan periksa kembali GEMINI_API_KEY pada konfigurasi environment server. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
+
+  const isApiKeyIssue =
+    reasonUpper.startsWith('API_KEY') ||
+    upper.includes('API_KEY_INVALID') ||
+    upper.includes('API KEY') ||
+    statusProp === 403 ||
+    grpcUpper === 'PERMISSION_DENIED' ||
+    upper.includes('PERMISSION_DENIED');
+
+  if (isApiKeyIssue) {
+    const errorCode = 'INVALID_GEMINI_API_KEY';
+    const httpStatus = statusProp === 400 ? 400 : 403;
+    return {
+      httpStatus,
+      errorCode,
+      message: `Kunci GEMINI_API_KEY tidak valid atau aksesnya dibatasi. Silakan periksa API key dan izin API di panel environment/secrets server. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
+
+  if (statusProp === 400 || grpcUpper === 'INVALID_ARGUMENT') {
+    const errorCode = 'GEMINI_INVALID_ARGUMENT';
+    return {
+      httpStatus: 400,
+      errorCode,
+      message: `Permintaan ke Gemini API ditolak karena format payload atau konfigurasi model tidak valid. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
+
+  if (statusProp === 404 || grpcUpper === 'NOT_FOUND' || upper.includes('NOT_FOUND')) {
+    const errorCode = 'GEMINI_MODEL_NOT_FOUND';
     return {
       httpStatus: 502,
-      errorCode: 'GEMINI_MODEL_NOT_FOUND',
-      message:
-        'Model Gemini yang dikonfigurasi tidak ditemukan atau tidak didukung. Silakan periksa konfigurasi model pada server.',
+      errorCode,
+      message: `Model Gemini yang dikonfigurasi tidak ditemukan atau tidak didukung oleh endpoint API. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
     };
   }
 
+  if (
+    statusProp === 500 ||
+    statusProp === 503 ||
+    grpcUpper === 'INTERNAL' ||
+    grpcUpper === 'UNAVAILABLE'
+  ) {
+    const errorCode = 'GEMINI_UPSTREAM_UNAVAILABLE';
+    return {
+      httpStatus: statusProp === 503 ? 503 : 502,
+      errorCode,
+      message: `Server Gemini AI sedang tidak tersedia atau mengalami gangguan internal sementara. Silakan coba kembali beberapa saat lagi. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
+
+  if (isNetworkError) {
+    const errorCode = 'GEMINI_NETWORK_ERROR';
+    return {
+      httpStatus: 502,
+      errorCode,
+      message: `Gagal menjangkau endpoint Gemini AI dari server (gangguan jaringan). ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+      diagnostic,
+    };
+  }
+
+  const errorCode = 'GEMINI_UPSTREAM_ERROR';
   return {
     httpStatus: 502,
-    errorCode: 'GEMINI_UPSTREAM_ERROR',
-    message:
-      'Layanan Gemini AI sedang mengalami gangguan koneksi sementara. Silakan coba kembali beberapa saat lagi.',
+    errorCode,
+    message: `Layanan Gemini AI mengembalikan kesalahan yang tidak terduga. ${formatDiagnosticSuffix(errorCode, diagnostic)}`,
+    diagnostic,
   };
 }
 

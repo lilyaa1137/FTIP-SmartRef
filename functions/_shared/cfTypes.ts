@@ -1,3 +1,5 @@
+import { sanitizeDiagnosticDetail } from '../../src/utils/academicCore.ts';
+
 export interface CfPagesEnv {
   GEMINI_API_KEY?: string;
 }
@@ -59,6 +61,13 @@ export interface GeminiRestContent {
   parts: GeminiRestPart[];
 }
 
+export interface GeminiRestErrorDetail {
+  '@type'?: string;
+  reason?: string;
+  domain?: string;
+  metadata?: Record<string, string>;
+}
+
 export interface GeminiRestResponse {
   candidates?: Array<{
     content?: GeminiRestContent;
@@ -67,20 +76,65 @@ export interface GeminiRestResponse {
     code?: number;
     message?: string;
     status?: string;
+    details?: GeminiRestErrorDetail[];
   };
+}
+
+export class GeminiUpstreamError extends Error {
+  status?: number;
+  upstreamHttpStatus?: number;
+  upstreamCode?: number;
+  grpcStatus?: string;
+  reason?: string;
+  diagnosticMessage?: string;
+  isTimeout?: boolean;
+  isNetworkError?: boolean;
+  isNonJson?: boolean;
+
+  constructor(
+    message: string,
+    opts: {
+      status?: number;
+      upstreamHttpStatus?: number;
+      upstreamCode?: number;
+      grpcStatus?: string;
+      reason?: string;
+      diagnosticMessage?: string;
+      isTimeout?: boolean;
+      isNetworkError?: boolean;
+      isNonJson?: boolean;
+    } = {}
+  ) {
+    super(message);
+    this.name = 'GeminiUpstreamError';
+    this.status = opts.status;
+    this.upstreamHttpStatus = opts.upstreamHttpStatus;
+    this.upstreamCode = opts.upstreamCode;
+    this.grpcStatus = opts.grpcStatus;
+    this.reason = opts.reason;
+    this.diagnosticMessage = opts.diagnosticMessage;
+    this.isTimeout = opts.isTimeout;
+    this.isNetworkError = opts.isNetworkError;
+    this.isNonJson = opts.isNonJson;
+  }
 }
 
 export async function callGeminiRest(
   apiKey: string,
   model: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  options: { timeoutMs?: number } = {}
 ): Promise<GeminiRestResponse> {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent`;
+  const timeoutMs = options.timeoutMs ?? 20000;
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -89,41 +143,104 @@ export async function callGeminiRest(
           'x-goog-api-key': apiKey,
         },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (!ct.includes('application/json')) {
-        const preview = await res.text().catch(() => '');
-        const err = new Error(`Gemini HTTP ${res.status}: ${preview.slice(0, 120)}`);
-        (err as { status?: number }).status = res.status;
-        throw err;
+        const rawText = await res.text().catch(() => '');
+        const stripped = rawText.replace(/<[^>]+>/g, ' ');
+        const detail = sanitizeDiagnosticDetail(stripped || `Non-JSON response (HTTP ${res.status})`, 160);
+        throw new GeminiUpstreamError(`Gemini HTTP ${res.status}: ${detail}`, {
+          status: res.status,
+          upstreamHttpStatus: res.status,
+          diagnosticMessage: detail,
+          isNonJson: true,
+        });
       }
 
-      const data = (await res.json()) as GeminiRestResponse;
+      let data: GeminiRestResponse;
+      try {
+        data = (await res.json()) as GeminiRestResponse;
+      } catch {
+        throw new GeminiUpstreamError(`Invalid JSON from Gemini HTTP ${res.status}`, {
+          status: res.status,
+          upstreamHttpStatus: res.status,
+          diagnosticMessage: `Malformed JSON body (HTTP ${res.status})`,
+          isNonJson: true,
+        });
+      }
+
       if (!res.ok || data.error) {
-        const msg = data.error?.message || `Gemini HTTP ${res.status}`;
-        const err = new Error(`${data.error?.status || ''} ${msg}`.trim());
-        (err as { status?: number }).status = data.error?.code || res.status;
-        if (attempt < 2 && (res.status === 500 || res.status === 503)) {
-          lastError = err;
-          await new Promise((r) => setTimeout(r, 600));
-          continue;
-        }
-        throw err;
+        const upstreamCode = typeof data.error?.code === 'number' ? data.error.code : undefined;
+        const effectiveStatus = upstreamCode || res.status;
+        const grpcStatus =
+          typeof data.error?.status === 'string' && data.error.status.trim()
+            ? data.error.status.trim()
+            : undefined;
+        const reason = Array.isArray(data.error?.details)
+          ? data.error.details.find((d) => typeof d?.reason === 'string' && d.reason.trim())?.reason?.trim()
+          : undefined;
+        const diagnosticMessage = sanitizeDiagnosticDetail(
+          data.error?.message || `Gemini HTTP ${res.status}`,
+          180
+        );
+
+        throw new GeminiUpstreamError(
+          `${grpcStatus ? `${grpcStatus} ` : ''}${diagnosticMessage}`.trim(),
+          {
+            status: effectiveStatus,
+            upstreamHttpStatus: res.status,
+            upstreamCode,
+            grpcStatus,
+            reason,
+            diagnosticMessage,
+          }
+        );
       }
 
       return data;
     } catch (err) {
-      lastError = err;
-      const statusProp =
-        typeof err === 'object' && err !== null && 'status' in err
-          ? Number((err as { status?: unknown }).status)
-          : NaN;
-      if (attempt < 2 && (statusProp === 500 || statusProp === 503 || Number.isNaN(statusProp))) {
+      let wrapped: GeminiUpstreamError;
+      if (err instanceof GeminiUpstreamError) {
+        wrapped = err;
+      } else {
+        const isAbort =
+          controller.signal.aborted ||
+          (err instanceof Error && err.name === 'AbortError');
+        if (isAbort) {
+          wrapped = new GeminiUpstreamError(`Gemini API request timed out after ${timeoutMs}ms`, {
+            status: 504,
+            isTimeout: true,
+            diagnosticMessage: `Request timeout (${timeoutMs}ms)`,
+          });
+        } else {
+          const detail = sanitizeDiagnosticDetail(
+            err instanceof Error ? err.message : String(err || 'Network fetch failed'),
+            180
+          );
+          wrapped = new GeminiUpstreamError(detail || 'Network fetch failed', {
+            isNetworkError: true,
+            diagnosticMessage: detail || 'Network fetch failed',
+          });
+        }
+      }
+
+      lastError = wrapped;
+      const shouldRetry =
+        attempt < 2 &&
+        (wrapped.status === 500 ||
+          wrapped.status === 503 ||
+          wrapped.isTimeout === true ||
+          wrapped.isNetworkError === true);
+
+      if (shouldRetry) {
         await new Promise((r) => setTimeout(r, 600));
         continue;
       }
-      throw err;
+      throw wrapped;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

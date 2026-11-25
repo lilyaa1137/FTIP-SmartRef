@@ -36,6 +36,7 @@ const SEARCH_TOOL_DECLARATION = {
 };
 
 export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
+  let stage = 'chat_init';
   try {
     let body: Record<string, unknown>;
     try {
@@ -90,11 +91,17 @@ export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
     let finalReply = '';
 
     for (let round = 0; round < 3; round++) {
-      const response = await callGeminiRest(apiKey, GEMINI_MODEL, {
-        contents,
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        tools: [{ functionDeclarations: [SEARCH_TOOL_DECLARATION] }],
-      });
+      stage = `chat_round_${round + 1}`;
+      const response = await callGeminiRest(
+        apiKey,
+        GEMINI_MODEL,
+        {
+          contents,
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          tools: [{ functionDeclarations: [SEARCH_TOOL_DECLARATION] }],
+        },
+        { timeoutMs: 20000 }
+      );
 
       const candidateContent = response.candidates?.[0]?.content;
       const parts: GeminiRestPart[] = Array.isArray(candidateContent?.parts)
@@ -208,12 +215,20 @@ export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
       verifiedArticles: Array.from(verifiedArticlesMap.values()).slice(0, 5),
     });
   } catch (error) {
-    console.error('[CF Pages /api/chat]', error);
     const classified = classifyGeminiError(error);
+    console.error('[CF Pages /api/chat]', {
+      stage,
+      errorCode: classified.errorCode,
+      ...classified.diagnostic,
+    });
     return jsonResponse(
       {
         errorCode: classified.errorCode,
         error: classified.message,
+        diagnostic: {
+          stage,
+          ...classified.diagnostic,
+        },
       },
       classified.httpStatus
     );

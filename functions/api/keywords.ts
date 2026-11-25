@@ -9,6 +9,7 @@ import { callGeminiRest, jsonResponse, readJsonBody, resolveApiKey } from '../_s
 import type { CfPagesHandler } from '../_shared/cfTypes.ts';
 
 export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
+  const stage = 'keywords_generate';
   try {
     let body: Record<string, unknown>;
     try {
@@ -109,7 +110,9 @@ export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
           ],
         },
       },
-    });
+    },
+    { timeoutMs: 20000 }
+    );
 
     const parts = response.candidates?.[0]?.content?.parts || [];
     const rawJson = parts
@@ -123,12 +126,20 @@ export const onRequestPost: CfPagesHandler = async ({ request, env }) => {
       sourceMode: 'gemini',
     });
   } catch (error) {
-    console.error('[CF Pages /api/keywords]', error);
     const classified = classifyGeminiError(error);
+    console.error('[CF Pages /api/keywords]', {
+      stage,
+      errorCode: classified.errorCode,
+      ...classified.diagnostic,
+    });
     return jsonResponse(
       {
         errorCode: classified.errorCode,
         error: classified.message,
+        diagnostic: {
+          stage,
+          ...classified.diagnostic,
+        },
       },
       classified.httpStatus
     );
